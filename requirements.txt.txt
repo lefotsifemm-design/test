@@ -1,0 +1,255 @@
+# requirements.txt
+# aiogram==3.*
+# aioschedule==0.7.1
+# python-dotenv
+
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from typing import Dict
+
+import aioschedule
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, CallbackQuery
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+TOKEN = os.getenv("BOT_TOKEN")          # ← ваш токен
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))  # ваш telegram id для уведомлений
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+router = Router()
+dp.include_router(router)
+
+# ────────────────────────────────────────────────
+#              Данные курсов (можно в БД)
+# ────────────────────────────────────────────────
+COURSES = {
+    "python_basic": {
+        "name": "Python с нуля",
+        "next_date": "2026-02-10 18:30",
+        "places_left": 8,
+        "price": "4 900 ₽"
+    },
+    "python_pro": {
+        "name": "Python Pro (ООП + FastAPI)",
+        "next_date": "2026-02-17 19:00",
+        "places_left": 5,
+        "price": "9 900 ₽"
+    },
+    "data_science": {
+        "name": "Data Science. Старт",
+        "next_date": "2026-03-01 17:00",
+        "places_left": 12,
+        "price": "14 900 ₽"
+    }
+}
+
+# Временное хранилище записей (в продакшене → SQLite / PostgreSQL)
+bookings: Dict[int, dict] = {}   # user_id → {"course": "...", "date": "...", "name": "...", "phone": "..."}
+
+# ────────────────────────────────────────────────
+#                   Состояния FSM
+# ────────────────────────────────────────────────
+class BookingForm(StatesGroup):
+    choosing_course = State()
+    name = State()
+    phone = State()
+    confirm = State()
+
+
+# ────────────────────────────────────────────────
+#                 Главное меню
+# ────────────────────────────────────────────────
+def get_main_kb() -> ReplyKeyboardMarkup:
+    builder = ReplyKeyboardBuilder()
+    builder.add(KeyboardButton(text="📝 Записаться на курс"))
+    builder.add(KeyboardButton(text="📋 Мои записи"))
+    builder.add(KeyboardButton(text="❌ Отмена записи"))
+    builder.add(KeyboardButton(text="💳 Способы оплаты"))
+    builder.adjust(2)  # по две в ряд
+    return builder.as_markup(resize_keyboard=True)
+
+
+# ────────────────────────────────────────────────
+#                 Старт / меню
+# ────────────────────────────────────────────────
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    text = (
+        "Добро пожаловать в бот записи на курсы! 🎓\n\n"
+        "Здесь можно:\n"
+        "• выбрать и забронировать место на курс\n"
+        "• посмотреть свои записи\n"
+        "• получить напоминание за сутки до начала\n\n"
+        "<i>Выберите действие ниже ↓</i>"
+    )
+    await message.answer(text, reply_markup=get_main_kb())
+
+    # ────────────────────────────────────────────────
+    #                 Способы оплаты
+    # ────────────────────────────────────────────────
+    @router.message(F.text == "💳 Способы оплаты")
+    async def payment_info(message: Message):
+        text = (
+            "💳 <b>Способы оплаты</b>\n\n"
+            "Оплата производится после записи на курс.\n\n"
+            "Доступные варианты:\n"
+            "• Перевод на карту Сбера / Тинькофф (реквизиты пришлю после записи)\n"
+            "• По счёту для юр.лиц\n"
+            "• Через ЮKassa / CloudPayments (ссылка на оплату)\n"
+            "• Криптовалюта USDT (TRC20/BEP20)\n\n"
+            "После успешной оплаты вы получите подтверждение и доступ к материалам.\n"
+            "Если есть вопросы — пишите сюда!"
+        )
+        await message.answer(text, reply_markup=get_main_kb())
+
+    # ────────────────────────────────────────────────
+    #                 Отмена записи
+    # ────────────────────────────────────────────────
+    class CancelForm(StatesGroup):
+        confirm = State()
+
+    @router.message(F.text == "❌ Отмена записи")
+    async def start_cancel(message: Message, state: FSMContext):
+        user_id = message.from_user.id
+        if user_id not in bookings:
+            await message.answer("У вас нет активных записей для отмены.", reply_markup=get_main_kb())
+            return
+
+        b = bookings[user_id]
+        await state.update_data(booking_to_cancel=b)
+
+        kb = ReplyKeyboardBuilder()
+        kb.add(KeyboardButton(text="✅ Да, отменить"))
+        kb.add(KeyboardButton(text="🔙 Нет, оставить"))
+        kb.adjust(1)
+
+        text = (
+            "Вы уверены, что хотите отменить запись?\n\n"
+            f"Курс: {b['course']}\n"
+            f"Дата: {b['date']}\n\n"
+            "После отмены место освободится для других."
+        )
+        await message.answer(text, reply_markup=kb.as_markup(resize_keyboard=True))
+        await state.set_state(CancelForm.confirm)
+
+    @router.message(CancelForm.confirm, F.text == "✅ Да, отменить")
+    async def confirm_cancel(message: Message, state: FSMContext):
+        data = await state.get_data()
+        b = data["booking_to_cancel"]
+        user_id = message.from_user.id
+
+        # Освобождаем место
+        for slug, course in COURSES.items():
+            if course["name"] == b["course"]:
+                course["places_left"] += 1
+                break
+
+        # Удаляем запись
+        bookings.pop(user_id, None)
+
+        await message.answer("✅ Запись успешно отменена!", reply_markup=get_main_kb())
+        await state.clear()
+
+        # Уведомляем админа
+        if ADMIN_ID:
+            await bot.send_message(
+                ADMIN_ID,
+                f"❌ Отмена записи!\n"
+                f"Пользователь: {message.from_user.full_name} (@{message.from_user.username or 'нет'})\n"
+                f"Курс: {b['course']}\n"
+                f"Дата: {b['date']}\n"
+                f"Имя: {b['name']}\n"
+                f"Контакт: {b['phone']}"
+            )
+
+    @router.message(CancelForm.confirm, F.text == "🔙 Нет, оставить")
+    async def decline_cancel(message: Message, state: FSMContext):
+        await message.answer("Отмена прервана. Ваша запись сохранена.", reply_markup=get_main_kb())
+        await state.clear()
+
+
+# ────────────────────────────────────────────────
+#                 Мои записи
+# ────────────────────────────────────────────────
+@router.message(F.text == "Мои записи")
+async def my_bookings(message: Message):
+    user_id = message.from_user.id
+    if user_id not in bookings:
+        await message.answer("У вас пока нет записей.")
+        return
+
+    b = bookings[user_id]
+    text = (
+        "<b>Ваша запись:</b>\n\n"
+        f"Курс: {b['course']}\n"
+        f"Дата: {b['date']}\n"
+        f"Имя: {b['name']}\n"
+        f"Контакт: {b['phone']}"
+    )
+    await message.answer(text)
+
+
+# ────────────────────────────────────────────────
+#              Напоминания (каждые 5 минут проверяем)
+# ────────────────────────────────────────────────
+async def send_reminders():
+    now = datetime.now()
+    tomorrow = now + timedelta(hours=23)   # за ~24 часа
+
+    to_remove = []
+    for uid, b in bookings.items():
+        try:
+            dt = datetime.fromisoformat(b["date"].replace(" ", "T"))
+            if tomorrow < dt < tomorrow + timedelta(minutes=70):
+                await bot.send_message(
+                    uid,
+                    f"🔔 <b>Напоминание!</b>\n\n"
+                    f"Завтра в {b['date']} начинается курс\n"
+                    f"<b>{b['course']}</b>\n"
+                    "Не забудьте присоединиться 😉"
+                )
+                logger.info(f"Напоминание отправлено пользователю {uid}")
+                # Можно пометить как "напомнили" и удалить позже
+                to_remove.append(uid)
+        except Exception as e:
+            logger.error(f"Ошибка при отправке напоминания {uid}: {e}")
+
+    for uid in to_remove:
+        bookings.pop(uid, None)
+
+
+async def scheduler():
+    aioschedule.every(5).minutes.do(send_reminders)
+    while True:
+        await aioschedule.run_pending()
+        await asyncio.sleep(1)
+
+
+# ────────────────────────────────────────────────
+#                 Запуск
+# ────────────────────────────────────────────────
+async def main():
+    # Удаляем webhook, если он был установлен раньше
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    asyncio.create_task(scheduler())  # запускаем планировщик
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+if __name__ == "__main__":
+    asyncio.run(main())
